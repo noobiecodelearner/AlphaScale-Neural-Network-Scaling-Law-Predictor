@@ -8,8 +8,8 @@ import torch.nn as nn
 import yaml
 
 from data.vision_loader import load_cifar10
-from data.nlp_loader import load_agnews
-from data.tabular_loader import load_adult
+from data.nlp_loader import load_yahoo
+from data.tabular_loader import load_tabular
 from models.cnn import ScalableCNN
 from models.transformer import ScalableTransformer
 from models.mlp import ScalableMLP
@@ -95,7 +95,7 @@ class ScalingRunner:
                 seed=self.seed,
             )
         elif domain == "nlp":
-            return load_agnews(
+            return load_yahoo(
                 data_path=self.cfg["data_path"],
                 dataset_fraction=fraction,
                 batch_size=batch_size,
@@ -103,7 +103,7 @@ class ScalingRunner:
                 seed=self.seed,
             )
         elif domain == "tabular":
-            return load_adult(
+            return load_tabular(
                 data_path=self.cfg["data_path"],
                 dataset_fraction=fraction,
                 batch_size=batch_size,
