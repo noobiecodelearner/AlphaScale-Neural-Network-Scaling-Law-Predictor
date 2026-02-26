@@ -5,7 +5,7 @@ stored as pre-tokenized tensors, then sliced per experiment.
 
 This means the expensive parquet read + tokenization happens only once
 per Python process regardless of how many scale/fraction combinations
-are run. Each subsequent call to load_agnews just slices tensors — 
+are run. Each subsequent call to load_yahoo just slices tensors — 
 takes milliseconds instead of minutes.
 """
 
@@ -131,7 +131,7 @@ def _build_cache(data_path: Path, max_seq_len: int, seed: int) -> None:
     print(f"  [Yahoo] Cache built. Subsequent calls will reuse tokenized tensors.", flush=True)
 
 
-def load_agnews(
+def load_yahoo(
     data_path: str,
     dataset_fraction: float = 1.0,
     batch_size: int = 128,
@@ -143,7 +143,7 @@ def load_agnews(
     First call: reads parquet + tokenizes everything (~5-10 min).
     Subsequent calls: slices pre-tokenized tensors (milliseconds).
 
-    Named load_agnews for drop-in compatibility with scaling_runner.py.
+    Named load_yahoo for drop-in compatibility with scaling_runner.py.
     """
     data_path = Path(data_path)
 
