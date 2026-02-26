@@ -1,14 +1,16 @@
-"""DBpedia-14 data loader for AlphaScale.
+"""Yahoo Answers Topics data loader for AlphaScale — cached version.
 
-Reads train.parquet / test.parquet produced by fancyzhx/dbpedia_14.
-Tokenization happens AFTER fraction sampling so small-fraction
-experiments don't pay the cost of tokenizing the full 560K corpus.
-Output format: (input_ids, attention_mask) dicts — identical to the
-previous AG News loader, so nothing else in the pipeline changes.
+The key optimisation: all text is tokenized ONCE at module load time,
+stored as pre-tokenized tensors, then sliced per experiment.
+
+This means the expensive parquet read + tokenization happens only once
+per Python process regardless of how many scale/fraction combinations
+are run. Each subsequent call to load_agnews just slices tensors — 
+takes milliseconds instead of minutes.
 """
 
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,25 +18,117 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers import BertTokenizer
 
+VAL_SIZE = 10_000  # fixed val set — enough for reliable evaluation
 
-class DBpediaDataset(Dataset):
-    """DBpedia-14 dataset with BERT tokenization.
+# ── Module-level cache — populated on first call, reused thereafter ───────
+_cache: Dict = {}
 
-    Args:
-        encodings: Dict of tokenizer outputs (input_ids, attention_mask).
-        labels: List of integer class labels (0-indexed, 0-13).
+
+class SliceDataset(Dataset):
+    """Dataset that slices pre-tokenized tensors by index list.
+
+    Avoids duplicating large tensors in memory — shares the underlying
+    storage and only materialises the needed rows at __getitem__ time.
     """
 
-    def __init__(self, encodings: Dict[str, torch.Tensor], labels: List[int]) -> None:
-        self.encodings = encodings
-        self.labels = labels
+    def __init__(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+        indices: List[int],
+    ) -> None:
+        self.input_ids      = input_ids
+        self.attention_mask = attention_mask
+        self.labels         = labels
+        self.indices        = indices
 
     def __len__(self) -> int:
-        return len(self.labels)
+        return len(self.indices)
 
     def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], int]:
-        item = {key: val[idx] for key, val in self.encodings.items()}
-        return item, self.labels[idx]
+        i = self.indices[idx]
+        return (
+            {
+                "input_ids":      self.input_ids[i],
+                "attention_mask": self.attention_mask[i],
+            },
+            int(self.labels[i]),
+        )
+
+
+def _build_cache(data_path: Path, max_seq_len: int, seed: int) -> None:
+    """Read parquet, tokenize everything once, store in _cache."""
+
+    print(f"  [Yahoo] Reading parquet files...", flush=True)
+    train_df = pd.concat([
+        pd.read_parquet(data_path / "train-00000-of-00002.parquet"),
+        pd.read_parquet(data_path / "train-00001-of-00002.parquet"),
+    ], ignore_index=True)
+    test_df = pd.read_parquet(data_path / "test-00000-of-00001.parquet")
+    print(f"  [Yahoo] {len(train_df):,} train / {len(test_df):,} test rows", flush=True)
+
+    def make_text(df: pd.DataFrame) -> List[str]:
+        t = df["question_title"].fillna("").astype(str)
+        c = df["question_content"].fillna("").astype(str)
+        a = df["best_answer"].fillna("").astype(str)
+        return (t + " " + c + " " + a).tolist()
+
+    train_texts  = make_text(train_df)
+    train_labels = train_df["topic"].tolist()
+    test_texts   = make_text(test_df)
+    test_labels  = test_df["topic"].tolist()
+
+    # ── Fixed val split ───────────────────────────────────────────────────
+    rng = np.random.RandomState(seed)
+    n_total    = len(train_texts)
+    all_idx    = rng.permutation(n_total)
+    val_idx    = all_idx[:VAL_SIZE].tolist()
+    train_pool = all_idx[VAL_SIZE:].tolist()   # remaining for train fractions
+
+    # ── Tokenize everything ONCE ──────────────────────────────────────────
+    bert_path = str(data_path.parent / "bert-base-uncased")
+    print(f"  [Yahoo] Loading tokenizer from {bert_path}...", flush=True)
+    tokenizer = BertTokenizer.from_pretrained(bert_path)
+
+    def tokenize(texts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+        enc = tokenizer(
+            texts,
+            padding="max_length",
+            truncation=True,
+            max_length=max_seq_len,
+            return_tensors="pt",
+        )
+        return enc["input_ids"], enc["attention_mask"]
+
+    # Tokenize val texts (10K — fast)
+    val_texts  = [train_texts[i] for i in val_idx]
+    val_labels_list = [train_labels[i] for i in val_idx]
+    print(f"  [Yahoo] Tokenizing {len(val_texts):,} val samples...", flush=True)
+    val_ids, val_mask = tokenize(val_texts)
+
+    # Tokenize full train pool (1.26M — slow, but only once)
+    pool_texts  = [train_texts[i] for i in train_pool]
+    pool_labels = [train_labels[i] for i in train_pool]
+    print(f"  [Yahoo] Tokenizing {len(pool_texts):,} train pool samples (once only)...", flush=True)
+    pool_ids, pool_mask = tokenize(pool_texts)
+
+    # Tokenize test set
+    print(f"  [Yahoo] Tokenizing {len(test_texts):,} test samples...", flush=True)
+    test_ids, test_mask = tokenize(test_texts)
+
+    _cache["pool_ids"]      = pool_ids
+    _cache["pool_mask"]     = pool_mask
+    _cache["pool_labels"]   = torch.tensor(pool_labels, dtype=torch.long)
+    _cache["pool_size"]     = len(pool_texts)
+    _cache["val_ids"]       = val_ids
+    _cache["val_mask"]      = val_mask
+    _cache["val_labels"]    = torch.tensor(val_labels_list, dtype=torch.long)
+    _cache["test_ids"]      = test_ids
+    _cache["test_mask"]     = test_mask
+    _cache["test_labels"]   = torch.tensor(test_labels, dtype=torch.long)
+    _cache["rng"]           = rng   # keep rng state for consistent sampling
+    print(f"  [Yahoo] Cache built. Subsequent calls will reuse tokenized tensors.", flush=True)
 
 
 def load_agnews(
@@ -44,80 +138,49 @@ def load_agnews(
     max_seq_len: int = 128,
     seed: int = 42,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """Load DBpedia-14 from parquet files and return train/val/test DataLoaders.
+    """Load Yahoo Answers and return DataLoaders.
 
-    Named load_agnews so scaling_runner.py requires zero changes.
-    Tokenization is performed AFTER fraction sampling.
+    First call: reads parquet + tokenizes everything (~5-10 min).
+    Subsequent calls: slices pre-tokenized tensors (milliseconds).
 
-    Args:
-        data_path: Directory containing train.parquet and test.parquet.
-        dataset_fraction: Fraction of training data to use.
-        batch_size: DataLoader batch size.
-        max_seq_len: Maximum token sequence length.
-        seed: Random seed for subset sampling.
-
-    Returns:
-        Tuple of (train_loader, val_loader, test_loader).
+    Named load_agnews for drop-in compatibility with scaling_runner.py.
     """
     data_path = Path(data_path)
 
-    # ── Load parquet (fast columnar read) ─────────────────────────────────
-    print(f"  [DBpedia] Reading parquet files...", flush=True)
-    train_df = pd.read_parquet(data_path / "train.parquet")
-    test_df  = pd.read_parquet(data_path / "test.parquet")
-    print(f"  [DBpedia] {len(train_df):,} train / {len(test_df):,} test rows", flush=True)
+    # Build cache on first call only
+    if not _cache:
+        _build_cache(data_path, max_seq_len, seed)
+    else:
+        print(f"  [Yahoo] Using cached tokenized tensors.", flush=True)
 
-    # labels are already 0-indexed (0-13)
-    train_texts  = (train_df["title"] + " " + train_df["content"]).tolist()
-    train_labels = train_df["label"].tolist()
-    test_texts   = (test_df["title"]  + " " + test_df["content"]).tolist()
-    test_labels  = test_df["label"].tolist()
+    # ── Slice train fraction from pool ────────────────────────────────────
+    pool_size = _cache["pool_size"]
+    n_train   = max(1, int(dataset_fraction * pool_size))
+    # Use first n_train indices — deterministic, no re-shuffling needed
+    # (pool was already randomly permuted during cache build)
+    train_indices = list(range(n_train))
+    val_indices   = list(range(len(_cache["val_labels"])))
+    test_indices  = list(range(len(_cache["test_labels"])))
 
-    # ── Val split: 10% of full training set ───────────────────────────────
-    rng = np.random.RandomState(seed)
-    n_total = len(train_texts)
-    all_idx = rng.permutation(n_total)
-    n_val          = max(1, int(0.1 * n_total))
-    val_idx        = all_idx[:n_val].tolist()
-    train_pool_idx = all_idx[n_val:]
+    print(f"  [Yahoo] Fraction={dataset_fraction} → "
+          f"{n_train:,} train / {len(val_indices):,} val / {len(test_indices):,} test",
+          flush=True)
 
-    # ── Apply fraction BEFORE tokenization ────────────────────────────────
-    n_train            = max(1, int(dataset_fraction * len(train_pool_idx)))
-    selected_train_idx = train_pool_idx[:n_train].tolist()
+    train_dataset = SliceDataset(
+        _cache["pool_ids"], _cache["pool_mask"], _cache["pool_labels"], train_indices
+    )
+    val_dataset = SliceDataset(
+        _cache["val_ids"], _cache["val_mask"], _cache["val_labels"], val_indices
+    )
+    test_dataset = SliceDataset(
+        _cache["test_ids"], _cache["test_mask"], _cache["test_labels"], test_indices
+    )
 
-    train_texts_sel  = [train_texts[i]  for i in selected_train_idx]
-    train_labels_sel = [train_labels[i] for i in selected_train_idx]
-    val_texts_sel    = [train_texts[i]  for i in val_idx]
-    val_labels_sel   = [train_labels[i] for i in val_idx]
-
-    print(f"  [DBpedia] Split → {len(train_texts_sel):,} train / "
-          f"{len(val_texts_sel):,} val / {len(test_texts):,} test", flush=True)
-
-    # ── Tokenizer from local BERT folder ──────────────────────────────────
-    bert_path = str(data_path.parent / "bert-base-uncased")
-    print(f"  [DBpedia] Loading tokenizer from {bert_path}...", flush=True)
-    tokenizer = BertTokenizer.from_pretrained(bert_path)
-
-    def tokenize(texts: List[str]) -> Dict[str, torch.Tensor]:
-        return tokenizer(
-            texts,
-            padding="max_length",
-            truncation=True,
-            max_length=max_seq_len,
-            return_tensors="pt",
-        )
-
-    print(f"  [DBpedia] Tokenizing...", flush=True)
-    train_enc = tokenize(train_texts_sel)
-    val_enc   = tokenize(val_texts_sel)
-    test_enc  = tokenize(test_texts)
-
-    train_dataset = DBpediaDataset(train_enc, train_labels_sel)
-    val_dataset   = DBpediaDataset(val_enc,   val_labels_sel)
-    test_dataset  = DBpediaDataset(test_enc,  test_labels)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  num_workers=4, pin_memory=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-    test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=4, pin_memory=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
+                              num_workers=4, pin_memory=True)
+    test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False,
+                              num_workers=4, pin_memory=True)
 
     return train_loader, val_loader, test_loader
