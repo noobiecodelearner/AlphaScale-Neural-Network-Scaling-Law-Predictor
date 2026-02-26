@@ -1,169 +1,158 @@
-"""UCI Adult data loader for AlphaScale — loads from local files."""
+"""Covertype tabular data loader for AlphaScale.
+
+Forest Cover Type dataset from UCI — 581,012 samples, 54 features, 7 classes.
+Features: 10 continuous (elevation, slope, etc.) + 44 binary (soil/wilderness).
+Labels: 1-7 shifted to 0-6 for cross-entropy compatibility.
+
+Named load_tabular for compatibility with scaling_runner.py.
+"""
 
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, Dataset
+
+# Module-level cache — built once, reused across all scale/fraction experiments
+_cache: Dict = {}
+
+VAL_SIZE   = 10_000
+TEST_SIZE  = 50_000
 
 
-COLUMN_NAMES = [
-    "age", "workclass", "fnlwgt", "education", "education_num",
-    "marital_status", "occupation", "relationship", "race", "sex",
-    "capital_gain", "capital_loss", "hours_per_week", "native_country", "income"
-]
+class CovertypeDataset(Dataset):
+    """Tabular dataset returning (feature_tensor, label) pairs."""
 
-CATEGORICAL_COLS = [
-    "workclass", "education", "marital_status", "occupation",
-    "relationship", "race", "sex", "native_country"
-]
-
-NUMERICAL_COLS = [
-    "age", "fnlwgt", "education_num", "capital_gain",
-    "capital_loss", "hours_per_week"
-]
-
-
-class AdultDataset(Dataset):
-    """UCI Adult dataset as a PyTorch Dataset.
-
-    Args:
-        features: Float32 tensor of shape (N, input_dim).
-        labels: Long tensor of shape (N,).
-    """
-
-    def __init__(self, features: torch.Tensor, labels: torch.Tensor) -> None:
-        self.features = features
-        self.labels = labels
+    def __init__(self, X: torch.Tensor, y: torch.Tensor) -> None:
+        self.X = X
+        self.y = y
 
     def __len__(self) -> int:
-        return len(self.labels)
+        return len(self.y)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.features[idx], self.labels[idx]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        return self.X[idx], int(self.y[idx])
 
 
-def _read_adult_file(filepath: str, skip_header: bool = False) -> pd.DataFrame:
-    """Read an adult.data or adult.test file into a DataFrame.
+class SliceDataset(Dataset):
+    """Slice pre-built tensors by index list — zero copy overhead."""
 
-    Args:
-        filepath: Path to the data file.
-        skip_header: Whether to skip the first row (adult.test has a header line).
+    def __init__(self, X: torch.Tensor, y: torch.Tensor, indices: List[int]) -> None:
+        self.X = X
+        self.y = y
+        self.indices = indices
 
-    Returns:
-        Cleaned DataFrame.
-    """
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        i = self.indices[idx]
+        return self.X[i], int(self.y[i])
+
+
+def _build_cache(data_path: Path, seed: int) -> None:
+    """Read CSV, scale features, split, store tensors once."""
+
+    print(f"  [Covertype] Reading covtype.data.gz...", flush=True)
     df = pd.read_csv(
-        filepath,
-        names=COLUMN_NAMES,
-        skipinitialspace=True,
-        na_values="?",
-        skiprows=1 if skip_header else 0,
+        data_path / "covtype.data.gz",
+        header=None,
+        compression="gzip",
     )
-    return df
+    print(f"  [Covertype] {len(df):,} samples, {df.shape[1]-1} features, 7 classes", flush=True)
+
+    X = df.iloc[:, :-1].values.astype(np.float32)   # 54 features
+    y = df.iloc[:, -1].values.astype(np.int64) - 1  # shift 1-7 → 0-6
+
+    # ── Train / val / test split ──────────────────────────────────────────
+    # Hold out fixed test set first, then carve val from remaining train pool
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=seed, stratify=y
+    )
+    X_pool, X_val, y_pool, y_val = train_test_split(
+        X_trainval, y_trainval,
+        test_size=VAL_SIZE, random_state=seed, stratify=y_trainval
+    )
+
+    # ── Standardize continuous features (first 10 columns) ───────────────
+    print(f"  [Covertype] Fitting scaler on {len(X_pool):,} train pool samples...", flush=True)
+    scaler = StandardScaler()
+    X_pool[:, :10]  = scaler.fit_transform(X_pool[:, :10])
+    X_val[:, :10]   = scaler.transform(X_val[:, :10])
+    X_test[:, :10]  = scaler.transform(X_test[:, :10])
+
+    # ── Convert to tensors ────────────────────────────────────────────────
+    _cache["pool_X"]   = torch.tensor(X_pool,  dtype=torch.float32)
+    _cache["pool_y"]   = torch.tensor(y_pool,  dtype=torch.long)
+    _cache["pool_size"] = len(y_pool)
+    _cache["val_X"]    = torch.tensor(X_val,   dtype=torch.float32)
+    _cache["val_y"]    = torch.tensor(y_val,   dtype=torch.long)
+    _cache["test_X"]   = torch.tensor(X_test,  dtype=torch.float32)
+    _cache["test_y"]   = torch.tensor(y_test,  dtype=torch.long)
+    _cache["n_features"] = X_pool.shape[1]
+
+    print(f"  [Covertype] Cache built: {len(y_pool):,} train pool / "
+          f"{len(y_val):,} val / {len(y_test):,} test", flush=True)
+    print(f"  [Covertype] Subsequent calls reuse cached tensors.", flush=True)
 
 
-def _preprocess(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Preprocess Adult data: encode, impute, normalize.
-
-    Args:
-        train_df: Raw training DataFrame.
-        test_df: Raw test DataFrame.
-
-    Returns:
-        Tuple of (X_train, y_train, X_test, y_test) as numpy float32 arrays.
-    """
-    # Clean income labels (test set has trailing periods)
-    train_df["income"] = train_df["income"].str.strip().str.replace(".", "", regex=False)
-    test_df["income"] = test_df["income"].str.strip().str.replace(".", "", regex=False)
-
-    # Drop rows with NaN
-    train_df = train_df.dropna().reset_index(drop=True)
-    test_df = test_df.dropna().reset_index(drop=True)
-
-    # Encode labels
-    y_train = (train_df["income"] == ">50K").astype(np.int64).values
-    y_test = (test_df["income"] == ">50K").astype(np.int64).values
-
-    # Drop label column
-    train_df = train_df.drop(columns=["income"])
-    test_df = test_df.drop(columns=["income"])
-
-    # One-hot encode categoricals — fit on train, apply to both
-    combined = pd.concat([train_df, test_df], axis=0)
-    combined = pd.get_dummies(combined, columns=CATEGORICAL_COLS)
-    n_train = len(train_df)
-
-    train_enc = combined.iloc[:n_train].values.astype(np.float32)
-    test_enc = combined.iloc[n_train:].values.astype(np.float32)
-
-    # Normalize numerical columns by train stats
-    num_col_indices = [
-        list(combined.columns).index(c) for c in NUMERICAL_COLS
-        if c in combined.columns
-    ]
-    means = train_enc[:, num_col_indices].mean(axis=0)
-    stds = train_enc[:, num_col_indices].std(axis=0) + 1e-8
-    train_enc[:, num_col_indices] = (train_enc[:, num_col_indices] - means) / stds
-    test_enc[:, num_col_indices] = (test_enc[:, num_col_indices] - means) / stds
-
-    return train_enc, y_train, test_enc, y_test
-
-
-def load_adult(
+def load_tabular(
     data_path: str,
     dataset_fraction: float = 1.0,
     batch_size: int = 256,
     seed: int = 42,
-) -> Tuple[DataLoader, DataLoader, DataLoader, int]:
-    """Load UCI Adult dataset from local files.
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Load Covertype and return train/val/test DataLoaders.
+
+    First call: reads CSV + scales features (~10 seconds).
+    Subsequent calls: slices pre-built tensors (milliseconds).
 
     Args:
-        data_path: Directory containing adult.data and adult.test.
-        dataset_fraction: Fraction of training data to use.
+        data_path: Directory containing covtype.data.gz.
+        dataset_fraction: Fraction of train pool to use.
         batch_size: DataLoader batch size.
-        seed: Random seed for subset sampling.
+        seed: Random seed (used only on first call for splits).
 
     Returns:
-        Tuple of (train_loader, val_loader, test_loader, input_dim).
+        Tuple of (train_loader, val_loader, test_loader).
     """
     data_path = Path(data_path)
-    train_df = _read_adult_file(str(data_path / "adult.data"), skip_header=False)
-    test_df = _read_adult_file(str(data_path / "adult.test"), skip_header=True)
 
-    X_train, y_train, X_test, y_test = _preprocess(train_df, test_df)
-    input_dim = X_train.shape[1]
+    if not _cache:
+        _build_cache(data_path, seed)
+    else:
+        print(f"  [Covertype] Using cached tensors.", flush=True)
 
-    X_train_t = torch.tensor(X_train, dtype=torch.float32)
-    y_train_t = torch.tensor(y_train, dtype=torch.long)
-    X_test_t = torch.tensor(X_test, dtype=torch.float32)
-    y_test_t = torch.tensor(y_test, dtype=torch.long)
+    pool_size = _cache["pool_size"]
+    n_train   = max(1, int(dataset_fraction * pool_size))
+    train_idx = list(range(n_train))
+    val_idx   = list(range(len(_cache["val_y"])))
+    test_idx  = list(range(len(_cache["test_y"])))
 
-    full_train = AdultDataset(X_train_t, y_train_t)
-    full_test = AdultDataset(X_test_t, y_test_t)
+    print(f"  [Covertype] Fraction={dataset_fraction} → "
+          f"{n_train:,} train / {len(val_idx):,} val / {len(test_idx):,} test", flush=True)
 
-    # Val split: 10%
-    rng = np.random.RandomState(seed)
-    n_total = len(full_train)
-    all_idx = rng.permutation(n_total)
-    n_val = max(1, int(0.1 * n_total))
-    val_idx = all_idx[:n_val].tolist()
-    train_pool_idx = all_idx[n_val:]
+    train_dataset = SliceDataset(_cache["pool_X"], _cache["pool_y"], train_idx)
+    val_dataset   = CovertypeDataset(_cache["val_X"],  _cache["val_y"])
+    test_dataset  = CovertypeDataset(_cache["test_X"], _cache["test_y"])
 
-    # Apply fraction
-    n_train = max(1, int(dataset_fraction * len(train_pool_idx)))
-    selected_train_idx = train_pool_idx[:n_train].tolist()
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=4, pin_memory=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
+                              num_workers=4, pin_memory=True)
+    test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False,
+                              num_workers=4, pin_memory=True)
 
-    train_subset = Subset(full_train, selected_train_idx)
-    val_subset = Subset(full_train, val_idx)
+    return train_loader, val_loader, test_loader, _cache["n_features"]
 
-    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    test_loader = DataLoader(full_test, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
-    return train_loader, val_loader, test_loader, input_dim
+def get_input_dim() -> int:
+    """Return number of input features (54 for Covertype).
+    
+    Call after load_tabular has been invoked at least once.
+    """
+    return _cache.get("n_features", 54)
