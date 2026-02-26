@@ -21,6 +21,16 @@ from utils.seed import set_seed
 from utils.logger import ExperimentLogger
 
 
+# Per-domain target accuracies used when --domain all is passed to
+# --generate_graphs or --optimize. These are set to values each domain
+# can actually reach based on experimental results.
+DOMAIN_TARGET_ACCURACIES = {
+    "vision":  0.85,
+    "nlp":     0.70,
+    "tabular": 0.90,
+}
+
+
 def _load_domain_results(
     domain: str,
     dataset_fraction: Optional[float],
@@ -120,6 +130,7 @@ def cmd_fit_surface(args: argparse.Namespace) -> None:
     print(f"  b     = {result['b']:.6f}")
     print(f"  alpha = {result['alpha']:.6f}")
     print(f"  R²    = {result['r2']:.6f}")
+    print(f"  MAE   = {result['mae']:.6f}")
     print(f"  AIC   = {result['aic']:.4f}")
 
     if args.bootstrap:
@@ -176,9 +187,9 @@ def cmd_optimize(args: argparse.Namespace) -> None:
     result = optimizer.optimize(
         target_accuracy=args.target_accuracy,
         observed_params=param_counts,
-        observed_accuracies=accuracies,       # real values for bootstrap
+        observed_accuracies=accuracies,
         observed_compute=compute_vals,
-        observed_train_times=train_times,     # real times for energy
+        observed_train_times=train_times,
         budget_flops=budget_flops,
     )
 
@@ -223,7 +234,17 @@ def cmd_generate_graphs(args: argparse.Namespace) -> None:
     domains = ["vision", "nlp", "tabular"] if args.domain == "all" else [args.domain]
     domain_data: dict = {}
 
+    # When running all domains, use per-domain targets so each domain gets
+    # a feasible target accuracy. When running a single domain, honour
+    # the --target_accuracy flag as before.
+    def _target_for(domain: str) -> float:
+        if args.domain == "all":
+            return DOMAIN_TARGET_ACCURACIES.get(domain, args.target_accuracy)
+        return args.target_accuracy
+
     for domain in domains:
+        target_accuracy = _target_for(domain)
+
         try:
             df = _load_domain_results(domain, args.dataset_fraction, args.log_path)
         except FileNotFoundError:
@@ -250,11 +271,11 @@ def cmd_generate_graphs(args: argparse.Namespace) -> None:
         bootstrapper = BootstrapUncertainty(n_bootstrap=100, seed=args.seed)
         n_grid = np.linspace(param_counts.min(), param_counts.max() * 2, 300)
         bs = bootstrapper.run(param_counts, accuracies,
-                              target_accuracy=args.target_accuracy, n_search=n_grid)
+                              target_accuracy=target_accuracy, n_search=n_grid)
 
         optimizer = ScaleOptimizer(fitter=fitter, bootstrap=bootstrapper)
         opt = optimizer.optimize(
-            target_accuracy=args.target_accuracy,
+            target_accuracy=target_accuracy,
             observed_params=param_counts,
             observed_accuracies=accuracies,
             observed_compute=compute_vals,
@@ -274,7 +295,7 @@ def cmd_generate_graphs(args: argparse.Namespace) -> None:
             "ci_lower":              np.array(bs["ci_lower"]),
             "ci_upper":              np.array(bs["ci_upper"]),
             "predicted_at_observed": fitter.predict(param_counts),
-            "target_accuracy":       args.target_accuracy,
+            "target_accuracy":       target_accuracy,
             "optimal_n":             opt.get("optimal_n"),
             "optimal_acc":           opt.get("expected_accuracy"),
             "optimal_flops":         opt.get("expected_compute_flops"),
@@ -344,7 +365,7 @@ def main() -> None:
 
     # Optimization options
     parser.add_argument("--target_accuracy", type=float, default=0.85,
-                        help="Target accuracy for optimization.")
+                        help="Target accuracy for optimization (overridden per-domain when --domain all).")
     parser.add_argument("--budget_gflops", type=float, default=None,
                         help="Maximum FLOPs budget in GFLOPs.")
 
