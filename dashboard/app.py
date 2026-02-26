@@ -56,8 +56,8 @@ carbon_intensity  = st.sidebar.number_input("Grid carbon intensity (g CO₂/kWh)
 
 DOMAIN_LABELS = {
     "vision":  "Vision (CIFAR-10)",
-    "nlp":     "NLP (AG News)",
-    "tabular": "Tabular (Adult Income)",
+    "nlp":     "NLP (Yahoo ANswers)",
+    "tabular": "Tabular (Covertype)",
 }
 
 # ── Load data ─────────────────────────────────────────────────────────────────
