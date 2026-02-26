@@ -1,7 +1,7 @@
 domain: nlp
-dataset: dbpedia
-data_path: data/raw/dbpedia
-num_classes: 14
+dataset: yahoo
+data_path: data/raw/yahoo
+num_classes: 10
 vocab_size: 30522
 max_seq_len: 128
 
@@ -12,12 +12,11 @@ dataset_fractions:
 
 model_scales:
   layer_dim_pairs:
-    - [1, 16]    # ~130K params
-    - [1, 32]    # ~520K params  
-    - [1, 48]    # ~1.1M params
-    - [1, 64]    # ~2M params
-    - [2, 128]   # ~4M params
-    - [4, 256]   # ~11M params
+    - [1, 16]
+    - [1, 48]
+    - [1, 64]
+    - [2, 128]
+    - [4, 256]
 
 training:
   epochs: 15
