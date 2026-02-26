@@ -1,8 +1,8 @@
 domain: tabular
-dataset: adult
-data_path: data/raw/adult
-num_classes: 2
-input_dim: 108
+dataset: covertype
+data_path: data/raw/covertype
+num_classes: 7
+input_dim: 54
 
 dataset_fractions:
   - 0.25
@@ -18,7 +18,7 @@ model_scales:
     - 512
 
 training:
-  epochs: 30
+  epochs: 20
   batch_size: 256
   optimizer: adam
   learning_rate: 0.001
