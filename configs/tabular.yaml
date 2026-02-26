@@ -1,0 +1,28 @@
+domain: tabular
+dataset: adult
+data_path: data/raw/adult
+num_classes: 2
+input_dim: 108
+
+dataset_fractions:
+  - 0.25
+  - 0.5
+  - 1.0
+
+model_scales:
+  hidden_sizes:
+    - 32
+    - 64
+    - 128
+    - 256
+    - 512
+
+training:
+  epochs: 30
+  batch_size: 256
+  optimizer: adam
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+energy:
+  gpu_wattage: 250

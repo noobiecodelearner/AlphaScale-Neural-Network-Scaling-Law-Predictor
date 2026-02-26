@@ -1,0 +1,30 @@
+domain: vision
+dataset: cifar10
+data_path: data/raw/cifar10/cifar-10-batches-py
+num_classes: 10
+input_channels: 3
+image_size: 32
+
+dataset_fractions:
+  - 0.25
+  - 0.5
+  - 1.0
+
+model_scales:
+  width_multipliers:
+    - 0.25
+    - 0.5
+    - 0.75
+    - 1.0
+    - 1.5
+    - 2.0
+
+training:
+  epochs: 20
+  batch_size: 128
+  optimizer: adam
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+energy:
+  gpu_wattage: 250
